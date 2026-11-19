@@ -7,9 +7,6 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-TMP = tempfile.mkdtemp()
-os.environ["COLDSTACK_DATA_DIR"] = TMP
-os.environ["COLDSTACK_DB"] = os.path.join(TMP, "test.db")
 
 import ai, engine, render  # noqa: E402
 from db import ex, init_db, now_iso, q, q1, set_setting  # noqa: E402
@@ -120,6 +117,45 @@ def test_full_flow(smtp_sink):
     lead = q1("SELECT * FROM leads WHERE email=?", (out["to_addr"],))
     engine.suppress(lead["email"], "test")
     assert engine.is_suppressed(lead["email"])
+
+
+def test_autopilot_drafts_and_import():
+    import json
+    from fastapi.testclient import TestClient
+    import main
+    set_setting("lead_provider", "demo")
+    client = TestClient(main.app)
+    pack = {"name": "AP test", "settings": {"timezone": "UTC", "window_start": "00:00", "window_end": "23:59",
+                                           "send_days": "mon,tue,wed,thu,fri,sat,sun"},
+            "autopilot": {"enabled": True, "daily_new_leads": 7, "max_total_leads": 10,
+                          "filters": {"titles": ["Owner"], "keywords": ["mobile detailing"]}},
+            "replies": {"mode": "draft", "context": "Free beta. Booking link: https://cal.example/r"},
+            "steps": [{"delay_days": 0, "variants": [{"label": "A", "subject": "hi", "body": "Hi {{first_name}}"}]}]}
+    r = client.post("/campaigns/import", data={"pack": json.dumps(pack)}, follow_redirects=False)
+    assert r.status_code == 303
+    c = q1("SELECT * FROM campaigns WHERE name='AP test'")
+    assert c["autopilot"] == 1 and c["autopilot_daily"] == 7 and q1("SELECT COUNT(*) n FROM steps WHERE campaign_id=?", (c["id"],))["n"] == 1
+    assert engine.launch_campaign(c["id"]) == 0          # list starts empty
+    assert engine.autopilot_tick() == 7                  # day 1: 7 new leads
+    assert engine.autopilot_tick() == 0                  # same day: nothing more
+    ex("UPDATE campaigns SET autopilot_last_run='2000-01-01' WHERE id=?", (c["id"],))
+    assert engine.autopilot_tick() == 3                  # next day: capped by max_total (10)
+    ids = [r["provider_id"] for r in q("SELECT provider_id FROM leads WHERE list_id=?", (c["list_id"],))]
+    assert len(ids) == len(set(ids)) == 10               # never the same person twice
+    engine.verify_tick(100)
+    engine.autopilot_tick()                              # enrols newly verified leads
+    assert q1("SELECT COUNT(*) n FROM enrollments WHERE campaign_id=?", (c["id"],))["n"] == 10
+    # an interested reply gets an AI (fallback) draft containing the booking link
+    lead = q1("SELECT * FROM leads WHERE list_id=? LIMIT 1", (c["list_id"],))
+    e = q1("SELECT * FROM enrollments WHERE lead_id=?", (lead["id"],))
+    mid = ex("INSERT INTO messages(kind, enrollment_id, campaign_id, lead_id, inbox_id, message_id, from_addr, to_addr, subject, "
+             "body, classification, created_at) VALUES ('in',?,?,?,?,'<x@y>',?,'me@x','Re: hi','Yes keen, tell me more','interested',?)",
+             (e["id"], c["id"], lead["id"], 1, lead["email"], now_iso()))
+    engine.draft_for(mid)
+    m = q1("SELECT * FROM messages WHERE id=?", (mid,))
+    assert m["draft_status"] == "ready" and "https://cal.example/r" in m["draft"]
+    assert client.get(f"/unibox?msg={mid}").status_code == 200
+    assert client.get(f"/campaigns/{c['id']}").status_code == 200
 
 
 """Apollo adapter against a response captured from the live API (search) and the documented bulk_match shape."""

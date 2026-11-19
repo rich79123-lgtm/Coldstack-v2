@@ -152,6 +152,8 @@ class ApolloProvider(Provider):
         kw = (filters.get("industries") or []) + (filters.get("keywords") or [])
         if kw:
             params["q_organization_keyword_tags"] = kw
+        if filters.get("email_statuses"):
+            params["contact_email_status"] = filters["email_statuses"]
         data = self._post("/mixed_people/api_search", params)
         rows = []
         for p in data.get("people", []) or []:

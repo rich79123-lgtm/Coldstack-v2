@@ -139,6 +139,7 @@ def leads_home(request: Request):
 @app.get("/leads/search", response_class=HTMLResponse)
 def lead_search_page(request: Request):
     return page(request, "lead_search.html", lists=q("SELECT * FROM lists ORDER BY id DESC"),
+                campaigns=q("SELECT id, name FROM campaigns ORDER BY id DESC"),
                 seniorities=ai.SENIORITIES, ranges=ai.EMPLOYEE_RANGES)
 
 
@@ -187,25 +188,7 @@ async def api_save(request: Request):
     return {"list_id": list_id, "requested": len(rows), "with_email": len(revealed), "added": added}
 
 
-def add_leads(list_id: int, rows: list, source: str) -> int:
-    n = 0
-    for r in rows:
-        email = (r.get("email") or "").strip().lower()
-        if not email:
-            continue
-        custom = r.get("custom") or {}
-        try:
-            ex("INSERT INTO leads(list_id, email, first_name, last_name, title, company, company_domain, industry, "
-               "company_size, location, linkedin_url, custom, source, provider_status, created_at) "
-               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-               (list_id, email, r.get("first_name", ""), r.get("last_name", ""), r.get("title", ""), r.get("company", ""),
-                r.get("company_domain", "") or email.split("@")[1], r.get("industry", ""), r.get("company_size", ""),
-                r.get("location", ""), r.get("linkedin_url", ""), json.dumps(custom), source,
-                r.get("provider_status", ""), now_iso()))
-            n += 1
-        except Exception:
-            pass  # duplicate in this list
-    return n
+add_leads = engine.add_leads
 
 
 CSV_ALIASES = {
@@ -498,6 +481,73 @@ async def ai_write(request: Request, cid: int):
     return {"steps": seq, "used_ai": bool(get_setting("anthropic_api_key"))}
 
 
+@app.post("/campaigns/{cid}/autopilot")
+async def save_autopilot(request: Request, cid: int):
+    f = await request.form()
+    try:
+        filters = json.loads(f.get("autopilot_filters") or "{}")
+        assert isinstance(filters, dict)
+    except Exception:
+        return back(f"/campaigns/{cid}", "Saved search must be valid JSON (or set it from Find leads).", "err")
+    ex("UPDATE campaigns SET autopilot=?, autopilot_daily=?, autopilot_max_total=?, autopilot_filters=?, reply_mode=?, "
+       "reply_context=? WHERE id=?",
+       (1 if f.get("autopilot") else 0, int(f.get("autopilot_daily") or 25), int(f.get("autopilot_max_total") or 1000),
+        json.dumps(filters), f.get("reply_mode") or "draft", f.get("reply_context") or "", cid))
+    return back(f"/campaigns/{cid}", "Autopilot settings saved")
+
+
+@app.post("/campaigns/{cid}/autopilot/run")
+def run_autopilot_now(cid: int):
+    c = q1("SELECT * FROM campaigns WHERE id=?", (cid,))
+    if c["status"] != "active" or not c["autopilot"]:
+        return back(f"/campaigns/{cid}", "Launch the campaign with autopilot switched on first.", "err")
+    ex("UPDATE campaigns SET autopilot_last_run='' WHERE id=?", (cid,))
+    engine.autopilot_tick()
+    c = q1("SELECT autopilot_note FROM campaigns WHERE id=?", (cid,))
+    return back(f"/campaigns/{cid}", c["autopilot_note"] + " New leads are verified, then enrolled within ~10 minutes.")
+
+
+@app.post("/api/campaigns/{cid}/autopilot-filters")
+async def set_autopilot_filters(request: Request, cid: int):
+    body = await request.json()
+    ex("UPDATE campaigns SET autopilot_filters=? WHERE id=?", (json.dumps(body.get("filters") or {}), cid))
+    return {"ok": True}
+
+
+@app.post("/campaigns/import")
+async def import_campaign(file: UploadFile | None = File(None), pack: str = Form("")):
+    """Create a complete campaign (list, saved search, sequence, settings, autopilot) from a campaign pack JSON."""
+    try:
+        raw = (await file.read()).decode("utf-8-sig") if file and file.filename else pack
+        p = json.loads(raw)
+    except Exception as e:
+        return back("/campaigns", f"Couldn't read that campaign pack: {e}", "err")
+    st = p.get("settings", {})
+    ap = p.get("autopilot", {})
+    list_id = ex("INSERT INTO lists(name, description, created_at) VALUES (?,?,?)",
+                 (p.get("list_name") or p.get("name", "Campaign") + " leads", p.get("description", ""), now_iso()))
+    cid = ex("INSERT INTO campaigns(name, list_id, timezone, window_start, window_end, send_days, daily_cap, stop_on_reply, "
+             "include_risky, unsubscribe_footer, plain_text, autopilot, autopilot_filters, autopilot_daily, "
+             "autopilot_max_total, reply_mode, reply_context, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             (p.get("name", "Imported campaign"), list_id, st.get("timezone", "Europe/London"),
+              st.get("window_start", "08:30"), st.get("window_end", "17:30"),
+              st.get("send_days", "mon,tue,wed,thu,fri"), int(st.get("daily_cap", 200)),
+              1 if st.get("stop_on_reply", True) else 0, 1 if st.get("include_risky", False) else 0,
+              1 if st.get("unsubscribe_footer", True) else 0, 1 if st.get("plain_text", True) else 0,
+              1 if ap.get("enabled", True) else 0, json.dumps(ap.get("filters", {})), int(ap.get("daily_new_leads", 25)),
+              int(ap.get("max_total_leads", 1000)), p.get("replies", {}).get("mode", "draft"),
+              p.get("replies", {}).get("context", ""), now_iso()))
+    for inbox in q("SELECT id FROM inboxes WHERE status='active'"):
+        ex("INSERT INTO campaign_inboxes VALUES (?,?)", (cid, inbox["id"]))
+    for pos, step in enumerate(p.get("steps", [])):
+        sid = ex("INSERT INTO steps(campaign_id, position, delay_days) VALUES (?,?,?)",
+                 (cid, pos, int(step.get("delay_days", 0 if pos == 0 else 3))))
+        for v in step.get("variants", []):
+            ex("INSERT INTO variants(step_id, label, subject, body) VALUES (?,?,?,?)",
+               (sid, v.get("label", "A"), v.get("subject", ""), v.get("body", "")))
+    return back(f"/campaigns/{cid}", "Campaign imported. Check the sequence and settings, then click Launch.")
+
+
 @app.post("/campaigns/{cid}/launch")
 def launch(cid: int):
     try:
@@ -538,7 +588,8 @@ def unibox(request: Request, label: str = "", msg: int = 0):
             ex("UPDATE messages SET is_read=1 WHERE id=?", (msg,))
             thread = q("SELECT * FROM messages WHERE lead_id=? AND kind IN ('out','in') ORDER BY id", (current["lead_id"],))
     counts = {r["classification"]: r["n"] for r in q("SELECT classification, COUNT(*) n FROM messages WHERE kind='in' GROUP BY classification")}
-    return page(request, "unibox.html", items=items, thread=thread, current=current, label=label, counts=counts,
+    pending = q1("SELECT COUNT(*) n FROM messages WHERE kind='in' AND draft_status='ready'")["n"]
+    return page(request, "unibox.html", pending=pending, items=items, thread=thread, current=current, label=label, counts=counts,
                 labels=ai.REPLY_LABELS)
 
 
@@ -548,7 +599,20 @@ def unibox_reply(mid: int, body: str = Form(...)):
         engine.send_manual_reply(mid, body)
     except mailer.SendError as e:
         return back(f"/unibox?msg={mid}", f"Send failed: {e}", "err")
+    ex("UPDATE messages SET draft_status='sent' WHERE id=?", (mid,))
     return back(f"/unibox?msg={mid}", "Reply sent")
+
+
+@app.post("/unibox/{mid}/draft")
+def unibox_redraft(mid: int):
+    m = q1("SELECT * FROM messages WHERE id=?", (mid,))
+    c = q1("SELECT * FROM campaigns WHERE id=?", (m["campaign_id"],)) if m and m["campaign_id"] else None
+    lead = q1("SELECT * FROM leads WHERE id=?", (m["lead_id"],)) or {}
+    inbox = q1("SELECT * FROM inboxes WHERE id=?", (m["inbox_id"],)) or {}
+    thread = q("SELECT kind, body FROM messages WHERE lead_id=? AND kind IN ('out','in') ORDER BY id", (m["lead_id"],))
+    draft = ai.draft_reply(lead, inbox, thread, (c or {}).get("reply_context", ""), m["classification"])
+    ex("UPDATE messages SET draft=?, draft_status='ready' WHERE id=?", (draft, mid))
+    return back(f"/unibox?msg={mid}")
 
 
 @app.post("/unibox/{mid}/label")
@@ -660,5 +724,5 @@ def api_replies(label: str = ""):
 @app.post("/api/engine/run")
 def api_run_engine():
     """Run every engine job once now (handy for testing)."""
-    return {"verified": engine.verify_tick(500), "sent": engine.send_tick(), "synced": engine.sync_tick(),
-            "warmup": engine.warmup_tick()}
+    return {"verified": engine.verify_tick(500), "autopilot": engine.autopilot_tick(), "sent": engine.send_tick(),
+            "synced": engine.sync_tick(), "warmup": engine.warmup_tick()}

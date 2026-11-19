@@ -11,6 +11,7 @@ JOBS = [  # (name, function, interval seconds)
     ("send", engine.send_tick, 20),
     ("sync", engine.sync_tick, 120),
     ("warmup", engine.warmup_tick, 300),
+    ("autopilot", engine.autopilot_tick, 600),
 ]
 
 _stop = threading.Event()

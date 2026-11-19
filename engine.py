@@ -102,18 +102,22 @@ def is_suppressed(email: str) -> bool:
     return bool(q1("SELECT 1 FROM suppression WHERE email IN (?, ?)", (email.lower(), domain.lower())))
 
 
-def launch_campaign(campaign_id: int) -> int:
-    c = q1("SELECT * FROM campaigns WHERE id=?", (campaign_id,))
+def check_ready(c: dict):
     if not c or not c["list_id"]:
         raise ValueError("Campaign needs a lead list.")
-    steps = campaign_steps(campaign_id)
+    steps = campaign_steps(c["id"])
     if not steps or not any(v["body"].strip() for v in steps[0]["variants"]):
         raise ValueError("Campaign needs at least one step with an email body.")
-    if not q1("SELECT 1 FROM campaign_inboxes WHERE campaign_id=?", (campaign_id,)):
+    if not q1("SELECT 1 FROM campaign_inboxes WHERE campaign_id=?", (c["id"],)):
         raise ValueError("Attach at least one sending inbox.")
+
+
+def enroll_new(c: dict) -> int:
+    """Enrol every verified lead in the campaign's list that isn't enrolled yet."""
     statuses = ("valid", "risky") if c["include_risky"] else ("valid",)
-    leads = q(f"SELECT id, email FROM leads WHERE list_id=? AND verify_status IN ({','.join('?' * len(statuses))})",
-              (c["list_id"], *statuses))
+    leads = q(f"SELECT id, email FROM leads WHERE list_id=? AND verify_status IN ({','.join('?' * len(statuses))}) "
+              "AND id NOT IN (SELECT lead_id FROM enrollments WHERE campaign_id=?)",
+              (c["list_id"], *statuses, c["id"]))
     n = 0
     now = now_iso()
     for lead in leads:
@@ -121,14 +125,21 @@ def launch_campaign(campaign_id: int) -> int:
             continue
         # don't email someone who is already in another active sequence
         if q1("SELECT 1 FROM enrollments e JOIN leads l ON l.id=e.lead_id WHERE l.email=? AND e.status='active' "
-              "AND e.campaign_id<>?", (lead["email"], campaign_id)):
+              "AND e.campaign_id<>?", (lead["email"], c["id"])):
             continue
         try:
             ex("INSERT INTO enrollments(campaign_id, lead_id, next_step, next_send_at, status, created_at) "
-               "VALUES (?,?,0,?,'active',?)", (campaign_id, lead["id"], now, now))
+               "VALUES (?,?,0,?,'active',?)", (c["id"], lead["id"], now, now))
             n += 1
         except Exception:
-            pass  # already enrolled
+            pass
+    return n
+
+
+def launch_campaign(campaign_id: int) -> int:
+    c = q1("SELECT * FROM campaigns WHERE id=?", (campaign_id,))
+    check_ready(c)
+    n = enroll_new(c)
     ex("UPDATE campaigns SET status='active' WHERE id=?", (campaign_id,))
     log_event("campaign", f"Campaign {c['name']} launched: {n} new leads enrolled")
     return n
@@ -184,7 +195,8 @@ def send_tick(max_per_tick=25) -> int:
         used = set()  # one send per inbox per tick keeps sending spread out
         due = q("SELECT * FROM enrollments WHERE campaign_id=? AND status='active' AND next_send_at<=? "
                 "ORDER BY next_step DESC, next_send_at LIMIT 200", (c["id"], now.isoformat()))
-        if not due and not q1("SELECT 1 FROM enrollments WHERE campaign_id=? AND status='active'", (c["id"],)):
+        if not due and not c["autopilot"] and \
+                not q1("SELECT 1 FROM enrollments WHERE campaign_id=? AND status='active'", (c["id"],)):
             ex("UPDATE campaigns SET status='completed' WHERE id=?", (c["id"],))
             log_event("campaign", f"Campaign {c['name']} completed")
             continue
@@ -347,7 +359,7 @@ def process_inbound(inbox: dict, m):
         return  # unrelated mail in this mailbox — leave it alone
 
     label = ai.classify_reply(subject, body)
-    ex("INSERT INTO messages(kind, enrollment_id, campaign_id, lead_id, inbox_id, message_id, in_reply_to, from_addr, "
+    in_id = ex("INSERT INTO messages(kind, enrollment_id, campaign_id, lead_id, inbox_id, message_id, in_reply_to, from_addr, "
        "to_addr, subject, body, classification, is_read, created_at) VALUES ('in',?,?,?,?,?,?,?,?,?,?,?,0,?)",
        (original["enrollment_id"], original["campaign_id"], original["lead_id"], inbox["id"], mid,
         original["message_id"], from_addr, inbox["email"], subject, body[:8000], label, now))
@@ -364,6 +376,10 @@ def process_inbound(inbox: dict, m):
             ex("UPDATE enrollments SET status='replied' WHERE status='active' AND lead_id IN "
                "(SELECT id FROM leads WHERE email=?)", (lead["email"],))
     log_event("reply", f"Reply from {from_addr}: {label}")
+    try:
+        draft_for(in_id)
+    except Exception as e:
+        log_event("reply", f"Draft failed: {e}", "warning")
     fire_webhook("reply", {"label": label, "from": from_addr, "subject": subject, "body": body[:4000],
                            "campaign_id": original["campaign_id"], "lead": {k: lead.get(k) for k in (
                                "email", "first_name", "last_name", "title", "company", "linkedin_url")}})
@@ -460,3 +476,107 @@ def _warmup_reply(inbox, to_addr, subject, mid):
                                                      msg["Subject"], now_iso()))
     except mailer.SendError:
         pass
+
+
+# ------------------------------------------------------------ lead storage
+
+def add_leads(list_id: int, rows: list, source: str) -> int:
+    import json
+    n = 0
+    for r in rows:
+        email = (r.get("email") or "").strip().lower()
+        if not email:
+            continue
+        try:
+            ex("INSERT INTO leads(list_id, email, first_name, last_name, title, company, company_domain, industry, "
+               "company_size, location, linkedin_url, custom, source, provider_status, provider_id, created_at) "
+               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (list_id, email, r.get("first_name", ""), r.get("last_name", ""), r.get("title", ""), r.get("company", ""),
+                r.get("company_domain", "") or email.split("@")[1], r.get("industry", ""), r.get("company_size", ""),
+                r.get("location", ""), r.get("linkedin_url", ""), json.dumps(r.get("custom") or {}), source,
+                r.get("provider_status", ""), r.get("provider_id", ""), now_iso()))
+            n += 1
+        except Exception:
+            pass  # duplicate in this list
+    return n
+
+
+# ------------------------------------------------------------ autopilot
+
+def autopilot_tick() -> int:
+    """For each active autopilot campaign: once a day pull fresh leads from the provider (never the same
+    person twice), let verification run, and enrol every newly verified lead."""
+    import json
+    from providers import ProviderError, get_provider
+    added_total = 0
+    today = utcnow().date().isoformat()
+    for c in q("SELECT * FROM campaigns WHERE status='active' AND autopilot=1"):
+        enroll_new(c)  # picks up leads verified since the last tick
+        if (c["autopilot_last_run"] or "")[:10] == today:
+            continue
+        in_list = q1("SELECT COUNT(*) n FROM leads WHERE list_id=?", (c["list_id"],))["n"]
+        want = min(int(c["autopilot_daily"] or 0), max(0, int(c["autopilot_max_total"] or 0) - in_list))
+        note = ""
+        page = int(c["autopilot_page"] or 1)
+        fresh = []
+        if want > 0:
+            filters = json.loads(c["autopilot_filters"] or "{}")
+            try:
+                prov = get_provider()
+                pages_tried = 0
+                while len(fresh) < want and pages_tried < 10:
+                    res = prov.search(filters, page, 100)
+                    pages_tried += 1
+                    if not res.rows:
+                        note = "Saved search is used up: widen the filters to keep finding new leads."
+                        break
+                    for r in res.rows:
+                        if r.get("provider_status") == "no email":
+                            continue
+                        pid = r.get("provider_id") or ""
+                        if pid and q1("SELECT 1 FROM leads WHERE provider_id=?", (pid,)):
+                            continue
+                        if r.get("email") and (is_suppressed(r["email"]) or q1("SELECT 1 FROM leads WHERE email=?", (r["email"].lower(),))):
+                            continue
+                        fresh.append(r)
+                        if len(fresh) >= want:
+                            break
+                    if len(fresh) < want or len(res.rows) < 100:
+                        page += 1
+                revealed = prov.reveal(fresh) if fresh else []
+                added = add_leads(c["list_id"], revealed, prov.name)
+                added_total += added
+                note = note or f"{today}: found {len(fresh)}, {len(revealed)} had emails, {added} added."
+            except ProviderError as e:
+                note = f"{today}: lead search failed: {e}"
+                log_event("autopilot", f"{c['name']}: {e}", "error")
+        else:
+            note = f"{today}: list is at its {c['autopilot_max_total']}-lead limit; no new leads pulled."
+        ex("UPDATE campaigns SET autopilot_last_run=?, autopilot_page=?, autopilot_note=? WHERE id=?",
+           (now_iso(), page, note, c["id"]))
+        log_event("autopilot", f"{c['name']}: {note}")
+    return added_total
+
+
+# ------------------------------------------------------------ reply drafts
+
+def draft_for(message_id: int):
+    """Write an AI reply draft for an inbound message; in 'auto' mode, send it for interested leads."""
+    m = q1("SELECT * FROM messages WHERE id=?", (message_id,))
+    if not m or not m["campaign_id"]:
+        return
+    c = q1("SELECT * FROM campaigns WHERE id=?", (m["campaign_id"],))
+    if not c or (c["reply_mode"] or "off") == "off" or m["classification"] not in ("interested", "other"):
+        return
+    lead = q1("SELECT * FROM leads WHERE id=?", (m["lead_id"],)) or {}
+    inbox = q1("SELECT * FROM inboxes WHERE id=?", (m["inbox_id"],)) or {}
+    thread = q("SELECT kind, body FROM messages WHERE lead_id=? AND kind IN ('out','in') ORDER BY id", (m["lead_id"],))
+    draft = ai.draft_reply(lead, inbox, thread, c["reply_context"] or "", m["classification"])
+    ex("UPDATE messages SET draft=?, draft_status='ready' WHERE id=?", (draft, message_id))
+    if c["reply_mode"] == "auto" and m["classification"] == "interested":
+        try:
+            send_manual_reply(message_id, draft)
+            ex("UPDATE messages SET draft_status='sent', is_read=1 WHERE id=?", (message_id,))
+            log_event("reply", f"Auto-replied to {m['from_addr']}")
+        except Exception as e:
+            log_event("reply", f"Auto-reply to {m['from_addr']} failed: {e}", "error")

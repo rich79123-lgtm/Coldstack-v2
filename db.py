@@ -125,9 +125,34 @@ def tx():
         conn.close()
 
 
+# Columns added after the first release. init_db() adds any that are missing, so an existing
+# database (e.g. on your Railway volume) upgrades itself on start-up without losing data.
+MIGRATIONS = {
+    "leads": [("provider_id", "TEXT DEFAULT ''")],
+    "campaigns": [
+        ("autopilot", "INTEGER DEFAULT 0"),             # 1 = find, verify and enrol new leads every day
+        ("autopilot_filters", "TEXT DEFAULT '{}'"),     # saved lead search
+        ("autopilot_daily", "INTEGER DEFAULT 25"),      # new leads (≈ provider credits) per day
+        ("autopilot_max_total", "INTEGER DEFAULT 1000"),
+        ("autopilot_page", "INTEGER DEFAULT 1"),
+        ("autopilot_last_run", "TEXT DEFAULT ''"),
+        ("autopilot_note", "TEXT DEFAULT ''"),
+        ("reply_mode", "TEXT DEFAULT 'draft'"),         # off | draft | auto
+        ("reply_context", "TEXT DEFAULT ''"),           # what the AI should know when drafting replies
+    ],
+    "messages": [("draft", "TEXT DEFAULT ''"), ("draft_status", "TEXT DEFAULT ''")],
+}
+
+
 def init_db():
     with tx() as c:
         c.executescript(SCHEMA)
+        for table, cols in MIGRATIONS.items():
+            have = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols:
+                if name not in have:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_leads_pid ON leads(provider_id)")
 
 
 def q(sql, params=()):

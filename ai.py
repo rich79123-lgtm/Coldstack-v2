@@ -211,3 +211,26 @@ def _heuristic_classify(subject: str, body: str) -> str:
                  r"calendar|call|meeting|pricing|how much|sounds good|happy to chat|\byes\b", t):
         return "interested"
     return "other"
+
+
+# ---------------------------------------------------------- reply drafting
+
+def draft_reply(lead: dict, inbox: dict, thread: list, context: str, label: str) -> str:
+    first = (lead.get("first_name") or "").strip() or "there"
+    me = (inbox.get("from_name") or "").split(" ")[0]
+    convo = "\n\n".join(f"{'ME' if t['kind'] == 'out' else 'THEM'}: {t['body'][:1500]}" for t in thread[-6:])
+    system = ("You write short, natural email replies for a founder doing cold outreach. Plain text, under 90 words, "
+              "warm and direct, no fluff, no subject line, no signature block (one is added), sign off with just the "
+              "sender's first name. Use ONLY facts from the context; never invent features, prices, dates or customer "
+              "numbers. If they ask something the context doesn't answer, say you'll come back to them on that. "
+              "Return {\"reply\": \"...\"}.")
+    prompt = (f"Context about the offer and what a good next step is:\n{context or '(none given)'}\n\n"
+              f"Lead: {first} {lead.get('last_name', '')}, {lead.get('title', '')} at {lead.get('company', '')}\n"
+              f"Sender first name: {me}\nTheir reply was classified as: {label}\n\nThread (oldest first):\n{convo}")
+    data = _ask_json(system, prompt, max_tokens=600)
+    if isinstance(data, dict) and data.get("reply"):
+        return str(data["reply"]).strip()
+    link = re.search(r"https?://\S+", context or "")
+    nxt = (f"Here's my calendar if a quick 10-minute call is easier: {link.group(0)}" if link
+           else "What's the best way to get you set up?")
+    return f"Hi {first},\n\nThanks for getting back to me, appreciate it.\n\n{nxt}\n\n{me}".strip()
